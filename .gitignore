@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.history/
+.pytest_cache/
+.claude/
+# large raw corpora (re-downloaded by build); trained artifacts in models/ are kept
+data/ru_full.txt
+data/rus_sentences.tsv.bz2
+data/leipzig.tar.gz
+data/prompt_corpus.txt

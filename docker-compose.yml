@@ -1,0 +1,27 @@
+# Local verification of the production image — NOT the deploy manifest.
+#
+# In Dokploy this app is an "Application" (git repo + Dockerfile builder): Dokploy
+# builds the image, injects env vars, and wires Traefik itself, so no compose file
+# is involved. This one exists so you can prove the container works on your own
+# machine before blaming the VPS.
+#
+#   OPENROUTER_API_KEY=sk-or-... docker compose up --build
+#   open http://localhost:8000
+#
+services:
+  web:
+    build: .
+    ports:
+      # host:container — on the server Traefik reaches the container port directly
+      # over the Docker network, so this mapping is a local-only convenience.
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      # Passed through from your shell; never hardcode it here. Without a key the
+      # container still serves the offline ghost layer — POST /next returns
+      # {"ok": false, "reason": "no_key"}, which is exactly the degraded mode
+      # you want to be able to reproduce.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+    restart: unless-stopped

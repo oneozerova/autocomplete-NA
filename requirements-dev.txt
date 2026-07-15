@@ -1,0 +1,5 @@
+streamlit>=1.30
+pytest>=7.0
+# build-time only: morphological tagging for the agreement model (src/morph.py).
+# NOT needed at runtime — the completer ships a pre-tagged table and uses stdlib.
+pymorphy3>=2.0

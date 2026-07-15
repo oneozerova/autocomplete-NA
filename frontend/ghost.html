@@ -1,0 +1,367 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  * { box-sizing: border-box; }
+  :root {
+    --fg: #1a1a1a; --bg: #ffffff; --border: #cfd2d6; --ghost: #b0b4ba;
+    --focus: #ff4b4b; --muted:#8a9098;
+    font-family: "Source Sans Pro", system-ui, -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e8; --bg:#0e1117; --border:#3a3f47; --ghost:#5b626b; --muted:#7a828b; }
+  }
+  .wrap { position: relative; }
+  #backdrop, #field {
+    font-size: 19px; line-height: 1.5; letter-spacing: 0;
+    padding: 13px 15px; width: 100%; border-radius: 12px;
+    white-space: pre; overflow: hidden; font-family: inherit;
+    border: 1px solid transparent;
+  }
+  /* back layer: opaque background + border + the grey ghost tail */
+  #backdrop {
+    position: absolute; inset: 0; pointer-events: none; z-index: 0;
+    background: var(--bg); border-color: var(--border);
+    color: transparent;                 /* typed span reserves space, invisible */
+  }
+  #backdrop #ghost { color: var(--ghost); }
+  /* LLM next-word/phrase suggestion: dotted underline distinguishes it from the
+     instant offline ending-ghost so the user can tell the two layers apart. */
+  #backdrop #phrase { color: var(--ghost); border-bottom: 1px dotted var(--muted); }
+  #spin { color: var(--muted); font-size: 11px; }
+  /* front layer: transparent input so the ghost behind it shows through */
+  #field {
+    position: relative; z-index: 1;
+    color: var(--fg); background: transparent;
+    outline: none; caret-color: var(--focus);
+  }
+  .wrap:focus-within #backdrop { border-color: var(--focus); }
+  .row { display:flex; justify-content:space-between; align-items:center;
+         margin-top: 8px; font-size: 12px; color: var(--muted); }
+  kbd { border: 1px solid var(--border); border-bottom-width: 2px;
+        border-radius: 5px; padding: 1px 6px; font-size: 11px; color: var(--fg); }
+  #status { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="backdrop"><span id="typed"></span><span id="ghost"></span><span id="phrase"></span></div>
+    <input id="field" type="text" autocomplete="off" autocorrect="off"
+           autocapitalize="off" spellcheck="false"
+           placeholder="Введите текст промпта…" />
+  </div>
+  <div class="row">
+    <span><kbd>Tab</kbd> — принять подсказку</span>
+    <span><span id="spin"></span> <span id="status"></span></span>
+  </div>
+
+<script>
+const MODEL = /*__MODEL__*/;
+
+// ---------- build a frequency trie (top-K cached per node) ----------------
+const CAP = 10;
+function makeTrie(words) {
+  const root = { c: {}, top: [] };   // words already sorted by freq desc
+  for (const [w, f] of words) {
+    let node = root;
+    for (const ch of w) {
+      let nx = node.c[ch];
+      if (!nx) nx = node.c[ch] = { c: {}, top: [] };
+      node = nx;
+      if (node.top.length < CAP) node.top.push([w, f]);
+    }
+  }
+  return root;
+}
+function query(trie, prefix) {
+  let node = trie;
+  for (const ch of prefix) { node = node.c[ch]; if (!node) return []; }
+  return node.top;
+}
+
+// ---------- windowed context (agreement) scoring --------------------------
+const CTX = MODEL.ctx, CFG = MODEL.cfg;
+const STOP = new Set(MODEL.stop || []);
+const UNI_KEYS = Object.keys(CTX.uni).length;
+const WIN = CTX.window || 1, DECAY = CTX.decay != null ? CTX.decay : 0.6;
+const ADJ_W = 1.0, TRI_W = 0.8, CONTENT_W = 0.6;   // mirror context_model.py
+const WORD_W = CFG.word_w != null ? CFG.word_w : 2.0, WORD_BACKOFF = -9.0;
+function suf(w) { return w.slice(-CFG.suf_len); }
+// signal 3: whole-word collocation P(cand | previous raw word)
+function logpWord(prevWord, cand) {
+  const t = CTX.wadj && CTX.wadj[prevWord];
+  if (t && t[cand] != null) return Math.log(t[cand] / CTX.wadj_total[prevWord]);
+  return WORD_BACKOFF;
+}
+function uniLogp(sb) {
+  return Math.log(((CTX.uni[sb] || 0) + 1) / (CTX.uni_total + UNI_KEYS + 1));
+}
+function logpAdj(sa, sb) {            // raw immediate-previous-word bigram
+  const t = CTX.adj && CTX.adj[sa];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.adj_total[sa]);
+  return Math.log(0.4) + uniLogp(sb);
+}
+function logpTri(sa2, sa1, sb) {      // raw suffix trigram, backoff to bigram
+  const t = CTX.tri && CTX.tri[sa2 + "|" + sa1];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.tri_total[sa2 + "|" + sa1]);
+  return Math.log(0.4) + logpAdj(sa1, sb);
+}
+function logpAt(d, sa, sb) {          // content skip-gram at distance d
+  const tbl = CTX.bigram[String(d)];
+  const t = tbl && tbl[sa];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.prev_total[String(d)][sa]);
+  return Math.log(0.4) + uniLogp(sb);
+}
+// blend adjacency + suffix-trigram + content window. rawPrev = last 2 raw words
+// (nearest first); prevContent = content words (nearest first).
+function ctxScore(rawPrev, prevContent, cand) {
+  const sb = suf(cand);
+  let tot = 0, used = false;
+  if (rawPrev.length) {
+    tot += ADJ_W * logpAdj(suf(rawPrev[0]), sb); used = true;
+    if (WORD_W) tot += WORD_W * logpWord(rawPrev[0], cand);   // signal 3
+    if (rawPrev.length >= 2)
+      tot += TRI_W * logpTri(suf(rawPrev[1]), suf(rawPrev[0]), sb);
+  }
+  const lim = Math.min(WIN, prevContent.length);
+  for (let d = 1; d <= lim; d++) {
+    tot += CONTENT_W * Math.pow(DECAY, d - 1) * logpAt(d, suf(prevContent[d - 1]), sb);
+    used = true;
+  }
+  return used ? tot : uniLogp(sb);
+}
+
+// ---------- factored grammatical agreement (morphology) -------------------
+// Mirrors agreement.py. MORPH: word -> 4-char code pos[N/V/A/O] number[s/p/-]
+// gender[m/f/n/-] nomn[1/0]. Tiny grammeme tables in AGR (re-keyed to codes).
+const MORPH = MODEL.morph || {}, AGR = MODEL.agr;
+const AGR_W = CFG.agr_w != null ? CFG.agr_w : 4.0;
+const HAS_AGR = AGR && Object.keys(MORPH).length > 0;
+function gnKey(code) { return code[2] + code[1]; }        // gender+number, e.g. "fs"
+function agrLogp(tbl, gov, cand) {
+  const row = tbl && tbl[gov];
+  if (!row) return null;
+  let total = 0, v = 0;
+  for (const k in row) { total += row[k]; v++; }
+  const a = AGR.alpha;
+  return Math.log(((row[cand] || 0) + a) / (total + a * v));
+}
+// resolve governors once (codes of preceding tokens, NEAREST FIRST)
+function governors(leftCodes) {
+  let subj = null, noun = null, adj = null;
+  for (const c of leftCodes) {
+    if (!c) continue;
+    if (subj === null && c[0] === "N" && c[3] === "1" && c[1] !== "-") subj = c[1];
+    if (noun === null && c[0] === "N") noun = gnKey(c);
+    if (adj === null && c[0] === "A") adj = gnKey(c);
+  }
+  return [subj, noun, adj];
+}
+function agrScore(govs, code) {
+  if (!code) return null;
+  const subj = govs[0], noun = govs[1], adj = govs[2];
+  if (code[0] === "V" && code[1] !== "-" && subj) return agrLogp(AGR.vnum, subj, code[1]);
+  if (code[0] === "A" && noun) return agrLogp(AGR.adj_gn, noun, gnKey(code));
+  if (code[0] === "N" && adj) return agrLogp(AGR.noun_gn, adj, gnKey(code));
+  return null;
+}
+
+const WORD = /[а-яёА-ЯЁ]+(?:-[а-яёА-ЯЁ]+)*/g;
+const TAIL = /[а-яёА-ЯЁ]+(?:-[а-яёА-ЯЁ]+)*$/;
+
+// confidence gating for the inline ghost (mirrors completer.py). A Russian ending
+// is ambiguous mid-word (после «молод» валидны -ой/-ого/-ая/-ые), so we read the
+// blended scores as P(word) via a tempered softmax and either commit the full
+// ending (one form dominates) or show only the chars all plausible endings share
+// (shell-style unambiguous expansion) — never a wrong tail. Tuned in
+// src/eval_ghost_chars.py (wrong-char-rate 28%→17% at unchanged usefulness).
+const GHOST_MIN_PREFIX = 3;
+const GHOST_TEMP = 2.0;      // softmax temperature over blended scores
+const GHOST_P_HIGH = 0.55;   // one ending owning >= this mass -> full completion
+const GHOST_P_COVER = 0.80;  // else: shared prefix of leaders covering this mass
+const GHOST_CAND_K = 8;      // candidates considered for the mass / LCP decision
+let ghostPartial = false;    // set by ghostFor: true = mid-word tail (no space on accept)
+
+function softmax(scores, temp) {
+  const m = Math.max(...scores);
+  const exps = scores.map((s) => Math.exp((s - m) / temp));
+  const z = exps.reduce((a, b) => a + b, 0) || 1;
+  return exps.map((e) => e / z);
+}
+function commonPrefix(strs) {           // LCP of a set == LCP of its min and max
+  if (!strs.length) return "";
+  let lo = strs[0], hi = strs[0];
+  for (const s of strs) { if (s < lo) lo = s; if (s > hi) hi = s; }
+  let i = 0;
+  while (i < lo.length && i < hi.length && lo[i] === hi[i]) i++;
+  return lo.slice(0, i);
+}
+
+const trie = makeTrie(MODEL.words);
+
+// ---------- confident top-1 completion of the word currently being typed ----
+function ghostFor(text) {
+  ghostPartial = false;
+  const m = text.match(TAIL);
+  if (!m) return "";
+  const prefix = m[0].toLowerCase();
+  if (prefix.length < GHOST_MIN_PREFIX) return "";  // не гадаем на коротком огрызке
+  const left = text.slice(0, text.length - m[0].length);
+  const all = (left.match(WORD) || []).map((w) => w.toLowerCase());
+  const rawPrev = all.slice(-2).reverse();                   // last 2 raw words
+  // content words (function words filtered), nearest first, capped to window
+  const content = all.filter((w) => !STOP.has(w) && w.length >= 2)
+                     .reverse().slice(0, WIN);
+
+  const cands = query(trie, prefix).filter(([w]) => w !== prefix);
+  if (!cands.length) return "";
+
+  // agreement applies only when there IS context; otherwise rank by frequency
+  // alone (so the citation form is the default).
+  let ctxNorm = null;
+  if (rawPrev.length || content.length) {
+    const cs = cands.map(([w]) => ctxScore(rawPrev, content, w));
+    const lo = Math.min(...cs), hi = Math.max(...cs), rng = (hi - lo) || 1;
+    ctxNorm = cs.map((v) => (v - lo) / rng);
+  }
+
+  // grammatical agreement (number/gender): centered log-prob, only re-orders
+  // candidates that share a governor (subject/head), else leaves them untouched.
+  let agrTerm = null;
+  if (HAS_AGR && all.length) {
+    const win = AGR.gov_window || 4;
+    const govs = governors(all.slice(-win).reverse().map((w) => MORPH[w]));
+    if (govs[0] || govs[1] || govs[2]) {
+      const raw = cands.map(([w]) => agrScore(govs, MORPH[w]));
+      const app = raw.filter((v) => v != null);
+      if (app.length >= 2) {
+        const mean = app.reduce((a, b) => a + b, 0) / app.length;
+        agrTerm = raw.map((v) => (v == null ? 0 : v - mean));
+      }
+    }
+  }
+
+  // score every candidate, then sort desc so the softmax mass is in order
+  const scored = cands.map(([w, f], i) => ({
+    ending: w.slice(prefix.length),
+    score: CFG.alpha * Math.log(f) + (ctxNorm ? CFG.gamma * ctxNorm[i] : 0)
+         + (agrTerm ? AGR_W * agrTerm[i] : 0),
+    ok: w.startsWith(prefix),
+  })).filter((c) => c.ok).slice(0, GHOST_CAND_K);
+  if (!scored.length) return "";
+  scored.sort((a, b) => b.score - a.score);
+
+  const probs = softmax(scored.map((c) => c.score), GHOST_TEMP);
+  // CONFIDENT: one ending dominates -> commit its full completion.
+  if (probs[0] >= GHOST_P_HIGH) { ghostPartial = false; return scored[0].ending; }
+  // SAFE PARTIAL: fewest leaders covering p_cover mass; show their shared prefix.
+  let acc = 0; const group = [];
+  for (let i = 0; i < scored.length; i++) {
+    group.push(scored[i].ending); acc += probs[i];
+    if (acc >= GHOST_P_COVER) break;
+  }
+  const safe = commonPrefix(group);
+  if (!safe) return "";                    // endings diverge at once — stay silent
+  ghostPartial = true;                     // mid-word tail: accept without a space
+  return safe;
+}
+
+// ---------- LLM next-word layer (debounced, cancellable, cached) -----------
+// Mirrors src/llm_next.py's Debouncer on the client so only paused, between-word,
+// enough-context states ever hit the /next proxy — the offline ghost owns the
+// rest. Perceived latency ≈ DEBOUNCE_MS + server TTFT (~1 s), acceptable for a
+// phrase hint that only appears when you stop typing.
+const DEBOUNCE_MS = 400;
+const phraseCache = new Map();     // text -> suggestion (client-side LRU-ish)
+let llmEnabled = true;             // flipped off if the server has no key
+let debTimer = null, inflight = null, phrase = "";
+
+// gate: not mid-word (offline ghost handles that) AND >= 2 words of context
+function shouldSuggest(text) {
+  if (TAIL.test(text)) return false;
+  return (text.match(WORD) || []).length >= 2;
+}
+
+function requestPhrase(text) {
+  if (phraseCache.has(text)) { setPhrase(phraseCache.get(text), text); return; }
+  const ctrl = new AbortController();
+  inflight = ctrl;
+  spin.textContent = "…";
+  fetch("/next", {
+    method: "POST", signal: ctrl.signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  }).then((r) => r.json()).then((res) => {
+    spin.textContent = "";
+    if (text !== field.value) return;             // stale — user moved on
+    if (res.reason === "no_key") { llmEnabled = false; return; }
+    const s = res.ok ? res.suggestion : "";
+    phraseCache.set(text, s);
+    setPhrase(s, text, res.ttft_ms);
+  }).catch(() => { spin.textContent = ""; });     // aborted / network — stay quiet
+}
+
+function setPhrase(s, forText, ttft) {
+  if (forText !== field.value) return;
+  phrase = s || "";
+  phraseEl.textContent = phrase;
+  if (phrase && ttft) status.textContent = `LLM ${ttft} мс`;
+}
+
+function clearPhrase() {
+  phrase = "";
+  phraseEl.textContent = "";
+  if (inflight) { inflight.abort(); inflight = null; }   // cancel in-flight call
+  if (debTimer) { clearTimeout(debTimer); debTimer = null; }
+  spin.textContent = "";
+}
+
+// ---------- UI wiring -------------------------------------------------------
+const field = document.getElementById("field");
+const typed = document.getElementById("typed");
+const ghostEl = document.getElementById("ghost");
+const phraseEl = document.getElementById("phrase");
+const status = document.getElementById("status");
+const spin = document.getElementById("spin");
+let ghost = "";
+
+function render() {
+  const t0 = performance.now();
+  const atEnd = field.selectionStart === field.value.length;
+  ghost = atEnd ? ghostFor(field.value) : "";
+  typed.textContent = field.value;
+  ghostEl.textContent = ghost;
+  status.textContent = ghost ? `${(performance.now() - t0).toFixed(1)} мс` : "";
+
+  // The two layers are mutually exclusive: the ending-ghost fires only mid-word,
+  // the phrase layer only between words. Schedule an LLM call only when the
+  // offline ghost is silent and the gate passes.
+  clearPhrase();
+  if (llmEnabled && atEnd && !ghost && shouldSuggest(field.value)) {
+    const text = field.value;
+    debTimer = setTimeout(() => requestPhrase(text), DEBOUNCE_MS);
+  }
+}
+
+field.addEventListener("input", render);
+field.addEventListener("keyup", (e) => { if (e.key !== "Tab") render(); });
+field.addEventListener("click", render);
+field.addEventListener("keydown", (e) => {
+  if (e.key === "Tab" && (ghost || phrase)) {
+    e.preventDefault();
+    // A partial ending-ghost (LCP tail) leaves the cursor mid-word, so no trailing
+    // space; a full word (confident ending, or the LLM phrase) gets one.
+    const tail = ghost || phrase;
+    const space = (ghost && ghostPartial) ? "" : " ";
+    field.value = field.value + tail + space;
+    field.selectionStart = field.selectionEnd = field.value.length;
+    render();
+  }
+});
+
+window.addEventListener("load", () => { field.focus(); render(); });
+</script>
+</body>
+</html>

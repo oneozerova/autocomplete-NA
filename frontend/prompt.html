@@ -1,0 +1,764 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  * { box-sizing: border-box; }
+  :root {
+    --fg:#1a1a1a; --bg:#ffffff; --border:#cfd2d6; --muted:#8a9098; --ghost:#b0b4ba;
+    --focus:#ff4b4b; --chip:#eef1f4; --chip-br:#d7dce1;
+    font-family: "Source Sans Pro", system-ui, -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e8; --bg:#0e1117; --border:#3a3f47; --muted:#7a828b; --ghost:#5b626b;
+            --chip:#1c222b; --chip-br:#39414c; }
+  }
+  .prompt {
+    font-size: 19px; line-height: 1.9; padding: 13px 15px; width: 100%;
+    min-height: 96px; border-radius: 12px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg); outline: none;
+    white-space: pre-wrap; word-break: break-word; caret-color: var(--focus);
+  }
+  .prompt:focus-within { border-color: var(--focus); }
+  .prompt:empty:before { content: attr(data-ph); color: var(--muted); }
+
+  /* inline offline ending-ghost + LLM phrase (dotted) — mirror ghost.html */
+  .ghost  { color: var(--ghost); }
+  .phrase { color: var(--ghost); border-bottom: 1px dotted var(--muted); }
+
+  /* --- inline chip base --- */
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px; vertical-align: baseline;
+    padding: 1px 8px; margin: 0 1px; border-radius: 999px; font-size: 0.86em;
+    background: var(--chip); border: 1px solid var(--chip-br); cursor: pointer;
+    user-select: none; -webkit-user-select: none; position: relative;
+    line-height: 1.5; white-space: nowrap;
+  }
+  .chip b { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .chip .step {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 17px; height: 17px; border-radius: 50%; background: rgba(127,127,127,.16);
+    font-weight: 700; line-height: 1;
+  }
+  .chip .step:active { background: var(--focus); color: #fff; }
+  .chip.count { color: #2b6cb0; }
+  .chip.percent { background:#2f6fd0; border-color:#2f6fd0; color:#fff; }
+  .chip.angle { background:#c0392b; border-color:#c0392b; color:#fff; }
+  .chip.preset { color: var(--fg); }
+  .swatch { width: 15px; height: 15px; border-radius: 50%;
+            border: 1px solid rgba(0,0,0,.25); box-shadow: 0 0 0 1px rgba(255,255,255,.35) inset; }
+  .dial { width: 15px; height: 15px; }
+  .dial line { stroke: #fff; stroke-width: 2; stroke-linecap: round; }
+  .dial circle { fill: none; stroke: rgba(255,255,255,.5); stroke-width: 1.5; }
+  .pop {
+    position: absolute; bottom: 130%; left: 50%; transform: translateX(-50%);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 10px; box-shadow: 0 6px 22px rgba(0,0,0,.22); z-index: 20;
+    display: none; align-items: center; gap: 8px; cursor: default;
+  }
+  .pop.open { display: flex; }
+  .pop input[type=range] { width: 120px; accent-color: var(--focus); }
+
+  .row { display:flex; justify-content:space-between; align-items:center;
+         margin-top: 8px; font-size: 12px; color: var(--muted); }
+  kbd { border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px;
+        padding: 1px 6px; font-size: 11px; color: var(--fg); }
+  #spin { color: var(--muted); font-size: 11px; }
+  #status { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <div id="prompt" class="prompt" contenteditable="true" spellcheck="false"
+       data-ph="Опишите картинку: «нарисуй 4 девушки в тёмном лес…» (Tab — принять)"></div>
+  <div class="row">
+    <span id="hint"><kbd>Tab</kbd> — принять подсказку · числа/цвета/углы кликабельны</span>
+    <span><span id="spin"></span> <span id="status"></span></span>
+  </div>
+
+<script>
+const MODEL = /*__MODEL__*/;
+
+// ============================================================================
+// PART 1 — offline ending-ghost engine (verbatim from ghost.html) ============
+// ============================================================================
+const CAP = 10;
+function makeTrie(words) {
+  const root = { c: {}, top: [] };
+  for (const [w, f] of words) {
+    let node = root;
+    for (const ch of w) {
+      let nx = node.c[ch];
+      if (!nx) nx = node.c[ch] = { c: {}, top: [] };
+      node = nx;
+      if (node.top.length < CAP) node.top.push([w, f]);
+    }
+  }
+  return root;
+}
+function query(trie, prefix) {
+  let node = trie;
+  for (const ch of prefix) { node = node.c[ch]; if (!node) return []; }
+  return node.top;
+}
+const CTX = MODEL.ctx, CFG = MODEL.cfg;
+const STOP = new Set(MODEL.stop || []);
+const UNI_KEYS = Object.keys(CTX.uni).length;
+const WIN = CTX.window || 1, DECAY = CTX.decay != null ? CTX.decay : 0.6;
+const ADJ_W = 1.0, TRI_W = 0.8, CONTENT_W = 0.6;
+const WORD_W = CFG.word_w != null ? CFG.word_w : 2.0, WORD_BACKOFF = -9.0;
+function suf(w) { return w.slice(-CFG.suf_len); }
+function logpWord(prevWord, cand) {
+  const t = CTX.wadj && CTX.wadj[prevWord];
+  if (t && t[cand] != null) return Math.log(t[cand] / CTX.wadj_total[prevWord]);
+  return WORD_BACKOFF;
+}
+function uniLogp(sb) {
+  return Math.log(((CTX.uni[sb] || 0) + 1) / (CTX.uni_total + UNI_KEYS + 1));
+}
+function logpAdj(sa, sb) {
+  const t = CTX.adj && CTX.adj[sa];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.adj_total[sa]);
+  return Math.log(0.4) + uniLogp(sb);
+}
+function logpTri(sa2, sa1, sb) {
+  const t = CTX.tri && CTX.tri[sa2 + "|" + sa1];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.tri_total[sa2 + "|" + sa1]);
+  return Math.log(0.4) + logpAdj(sa1, sb);
+}
+function logpAt(d, sa, sb) {
+  const tbl = CTX.bigram[String(d)];
+  const t = tbl && tbl[sa];
+  if (t && t[sb] != null) return Math.log(t[sb] / CTX.prev_total[String(d)][sa]);
+  return Math.log(0.4) + uniLogp(sb);
+}
+function ctxScore(rawPrev, prevContent, cand) {
+  const sb = suf(cand);
+  let tot = 0, used = false;
+  if (rawPrev.length) {
+    tot += ADJ_W * logpAdj(suf(rawPrev[0]), sb); used = true;
+    if (WORD_W) tot += WORD_W * logpWord(rawPrev[0], cand);
+    if (rawPrev.length >= 2)
+      tot += TRI_W * logpTri(suf(rawPrev[1]), suf(rawPrev[0]), sb);
+  }
+  const lim = Math.min(WIN, prevContent.length);
+  for (let d = 1; d <= lim; d++) {
+    tot += CONTENT_W * Math.pow(DECAY, d - 1) * logpAt(d, suf(prevContent[d - 1]), sb);
+    used = true;
+  }
+  return used ? tot : uniLogp(sb);
+}
+const MORPH = MODEL.morph || {}, AGR = MODEL.agr;
+const AGR_W = CFG.agr_w != null ? CFG.agr_w : 4.0;
+const HAS_AGR = AGR && Object.keys(MORPH).length > 0;
+function gnKey(code) { return code[2] + code[1]; }
+function agrLogp(tbl, gov, cand) {
+  const row = tbl && tbl[gov];
+  if (!row) return null;
+  let total = 0, v = 0;
+  for (const k in row) { total += row[k]; v++; }
+  const a = AGR.alpha;
+  return Math.log(((row[cand] || 0) + a) / (total + a * v));
+}
+function governors(leftCodes) {
+  let subj = null, noun = null, adj = null;
+  for (const c of leftCodes) {
+    if (!c) continue;
+    if (subj === null && c[0] === "N" && c[3] === "1" && c[1] !== "-") subj = c[1];
+    if (noun === null && c[0] === "N") noun = gnKey(c);
+    if (adj === null && c[0] === "A") adj = gnKey(c);
+  }
+  return [subj, noun, adj];
+}
+function agrScore(govs, code) {
+  if (!code) return null;
+  const subj = govs[0], noun = govs[1], adj = govs[2];
+  if (code[0] === "V" && code[1] !== "-" && subj) return agrLogp(AGR.vnum, subj, code[1]);
+  if (code[0] === "A" && noun) return agrLogp(AGR.adj_gn, noun, gnKey(code));
+  if (code[0] === "N" && adj) return agrLogp(AGR.noun_gn, adj, gnKey(code));
+  return null;
+}
+const WORD = /[а-яёА-ЯЁ]+(?:-[а-яёА-ЯЁ]+)*/g;
+const TAIL = /[а-яёА-ЯЁ]+(?:-[а-яёА-ЯЁ]+)*$/;
+// Safe completion (mirrors src/completer.py and ghost.html): read the blended
+// scores as P(word) via a tempered softmax and either commit the full ending (one
+// form dominates) or show only the chars all plausible endings share (shell-style
+// unambiguous expansion) — never a wrong tail. A hard margin gate cannot do this:
+// after «воины сто…» it happily showed «йте» (стойте), which is what "сбивает".
+const GHOST_MIN_PREFIX = 3;
+const GHOST_TEMP = 2.0;      // softmax temperature over blended scores
+const GHOST_P_HIGH = 0.55;   // one ending owning >= this mass -> full completion
+const GHOST_P_COVER = 0.80;  // else: shared prefix of leaders covering this mass
+const GHOST_CAND_K = 8;      // candidates considered for the mass / LCP decision
+let ghostPartial = false;    // set by ghostFor: true = mid-word tail (no space on accept)
+
+function softmax(scores, temp) {
+  const m = Math.max(...scores);
+  const exps = scores.map((s) => Math.exp((s - m) / temp));
+  const z = exps.reduce((a, b) => a + b, 0) || 1;
+  return exps.map((e) => e / z);
+}
+function commonPrefix(strs) {           // LCP of a set == LCP of its min and max
+  if (!strs.length) return "";
+  let lo = strs[0], hi = strs[0];
+  for (const s of strs) { if (s < lo) lo = s; if (s > hi) hi = s; }
+  let i = 0;
+  while (i < lo.length && i < hi.length && lo[i] === hi[i]) i++;
+  return lo.slice(0, i);
+}
+const trie = makeTrie(MODEL.words);
+function ghostFor(text) {
+  ghostPartial = false;
+  const m = text.match(TAIL);
+  if (!m) return "";
+  const prefix = m[0].toLowerCase();
+  if (prefix.length < GHOST_MIN_PREFIX) return "";
+  const left = text.slice(0, text.length - m[0].length);
+  const all = (left.match(WORD) || []).map((w) => w.toLowerCase());
+  const rawPrev = all.slice(-2).reverse();
+  const content = all.filter((w) => !STOP.has(w) && w.length >= 2).reverse().slice(0, WIN);
+  const cands = query(trie, prefix).filter(([w]) => w !== prefix);
+  if (!cands.length) return "";
+  let ctxNorm = null;
+  if (rawPrev.length || content.length) {
+    const cs = cands.map(([w]) => ctxScore(rawPrev, content, w));
+    const lo = Math.min(...cs), hi = Math.max(...cs), rng = (hi - lo) || 1;
+    ctxNorm = cs.map((v) => (v - lo) / rng);
+  }
+  let agrTerm = null;
+  if (HAS_AGR && all.length) {
+    const win = AGR.gov_window || 4;
+    const govs = governors(all.slice(-win).reverse().map((w) => MORPH[w]));
+    if (govs[0] || govs[1] || govs[2]) {
+      const raw = cands.map(([w]) => agrScore(govs, MORPH[w]));
+      const app = raw.filter((v) => v != null);
+      if (app.length >= 2) {
+        const mean = app.reduce((a, b) => a + b, 0) / app.length;
+        agrTerm = raw.map((v) => (v == null ? 0 : v - mean));
+      }
+    }
+  }
+  const scored = cands.map(([w, f], i) => ({
+    ending: w.slice(prefix.length),
+    score: CFG.alpha * Math.log(f) + (ctxNorm ? CFG.gamma * ctxNorm[i] : 0)
+         + (agrTerm ? AGR_W * agrTerm[i] : 0),
+    ok: w.startsWith(prefix),
+  })).filter((c) => c.ok).slice(0, GHOST_CAND_K);
+  if (!scored.length) return "";
+  scored.sort((a, b) => b.score - a.score);
+
+  const probs = softmax(scored.map((c) => c.score), GHOST_TEMP);
+  if (probs[0] >= GHOST_P_HIGH) return scored[0].ending;   // CONFIDENT: full ending
+  let acc = 0; const group = [];                            // SAFE PARTIAL: shared prefix
+  for (let i = 0; i < scored.length; i++) {
+    group.push(scored[i].ending); acc += probs[i];
+    if (acc >= GHOST_P_COVER) break;
+  }
+  const safe = commonPrefix(group);
+  if (!safe) return "";                    // endings diverge at once — stay silent
+  ghostPartial = true;                     // mid-word tail: accept without a space
+  return safe;
+}
+
+// ============================================================================
+// PART 2 — inline parameter chips (from chips.html) ==========================
+// ============================================================================
+const COLORS = [
+  ["красн", "#e23b3b"], ["син", "#3167e0"], ["голуб", "#49b6f0"],
+  ["зелён", "#33a852"], ["зелен", "#33a852"], ["жёлт", "#f3c62a"], ["желт", "#f3c62a"],
+  ["оранжев", "#f5842a"], ["фиолетов", "#8a3ff0"], ["розов", "#f06fae"],
+  ["чёрн", "#222222"], ["черн", "#222222"], ["бел", "#ececec"], ["сер", "#9aa0a6"],
+  ["коричнев", "#96613b"], ["бирюзов", "#1ec5c5"], ["золот", "#d4af37"],
+  ["серебр", "#c3c7cc"], ["пурпурн", "#a12bb0"], ["бордов", "#8c2231"],
+];
+// A colour stem alone is NOT enough: `сер` sits inside «сердце», «серьги»,
+// «сериал», `бел` inside «белка». A colour word = [modifier] + stem + a real
+// ADJECTIVE ending — that test rejects all of those and still keeps «серебряный»
+// (серебр+ян+ый) and «тёмно-синем».
+const MOD_RE = /^(?:тёмно-|темно-|светло-|ярко-|бледно-)/;
+const ADJ_TAIL =
+  /^(ян|ист|оват)?(ый|ий|ой|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ыми|ими|ым|им|ом|ем|ую|юю|ых|их)$/;
+function colorParts(word) {
+  const w = word.toLowerCase();
+  const mod = (w.match(MOD_RE) || [""])[0];
+  const base = w.slice(mod.length);
+  for (const [stem] of COLORS) {          // no break: `сер` must fall through to `серебр`
+    if (!base.startsWith(stem)) continue;
+    const m = base.slice(stem.length).match(ADJ_TAIL);
+    if (m) return { mod, stem, interfix: m[1] || "", ending: m[2] };
+  }
+  return null;
+}
+function colorHex(word) {
+  const p = colorParts(word);
+  if (!p) return "#888888";
+  let base = COLORS.find((c) => c[0] === p.stem)[1];
+  const w = word.toLowerCase();
+  if (/^(тёмно|темно)/.test(w)) base = shade(base, -0.28);
+  else if (/^(светло|бледно)/.test(w)) base = shade(base, 0.30);
+  else if (/^ярко/.test(w)) base = shade(base, 0.10);
+  return base;
+}
+// stem -> {ending -> real form}, so a recoloured chip keeps the grammatical form
+// it was typed in: «тёмно-синего» -> «тёмно-зелёного», not «зелёный». Indexed by
+// ENDING, not by morph code: the shipped code packs case into one bit (nom / not),
+// so «красную» and «золотой» share the code Asf0 and matching on it would produce
+// «золотой машину». Every form comes out of the vocabulary — we never invent one.
+// Built once, lazily (first colour chip), from the 80k forms already on the page.
+const SOFT_HARD = {                       // син-ий <-> зелён-ый: soft/hard stems
+  ий: ["ый", "ой"], ый: ["ий", "ой"], ой: ["ый", "ий"],
+  яя: ["ая"], ая: ["яя"], ее: ["ое"], ое: ["ее"], ие: ["ые"], ые: ["ие"],
+  его: ["ого"], ого: ["его"], ему: ["ому"], ому: ["ему"], юю: ["ую"], ую: ["юю"],
+  им: ["ым"], ым: ["им"], ем: ["ом"], ом: ["ем"], их: ["ых"], ых: ["их"],
+  ими: ["ыми"], ыми: ["ими"],
+};
+let colorIdx = null;
+function colorIndex() {
+  if (colorIdx) return colorIdx;
+  colorIdx = {};                          // stem -> ending -> [form, hasInterfix]
+  for (const [w] of MODEL.words) {        // freq-ordered, so the first form wins
+    const code = MORPH[w];
+    if (code && code[0] !== "A") continue;
+    const p = colorParts(w);
+    if (!p || p.mod) continue;
+    const slot = colorIdx[p.stem] || (colorIdx[p.stem] = {});
+    const prev = slot[p.ending];
+    // «золотистый» and «золотой» both live under stem `золот`; the plain
+    // stem+ending form is the colour itself, the interfixed one is a shade of it
+    if (!prev || (prev[1] && !p.interfix)) slot[p.ending] = [w, !!p.interfix];
+  }
+  return colorIdx;
+}
+function recolor(word, hex) {             // same form, new colour — or null
+  const p = colorParts(word);
+  if (!p) return null;
+  const forms = colorIndex()[nearestStem(hex)] || {};
+  let loose = null;
+  for (const e of [p.ending, ...(SOFT_HARD[p.ending] || [])]) {
+    const f = forms[e];
+    if (!f) continue;
+    if (!f[1]) return p.mod + f[0];       // «синий» -> «золотой», not «золотистый»
+    if (!loose) loose = p.mod + f[0];     // …but «серебряный» has no plain form
+  }
+  return loose;
+}
+function nearestStem(hex) {              // snap a picked colour to a nameable one
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  let best = null, bestD = Infinity;
+  for (const [stem, h] of COLORS) {
+    const m = parseInt(h.slice(1), 16);
+    const d = ((m >> 16 & 255) - r) ** 2 + ((m >> 8 & 255) - g) ** 2 + ((m & 255) - b) ** 2;
+    if (d < bestD) { bestD = d; best = stem; }
+  }
+  return best;
+}
+function shade(hex, amt) {
+  let n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const f = amt < 0 ? (1 + amt) : 1, add = amt > 0 ? amt * 255 : 0;
+  r = Math.max(0, Math.min(255, Math.round(r * f + add)));
+  g = Math.max(0, Math.min(255, Math.round(g * f + add)));
+  b = Math.max(0, Math.min(255, Math.round(b * f + add)));
+  return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+const NUM_M = ["ноль","один","два","три","четыре","пять","шесть","семь","восемь","девять","десять"];
+const NUM_F = ["ноль","одна","две","три","четыре","пять","шесть","семь","восемь","девять","десять"];
+const WORD2NUM = {};
+NUM_M.forEach((w, i) => WORD2NUM[w] = i);
+NUM_F.forEach((w, i) => WORD2NUM[w] = i);
+const PRESETS = {
+  res: ["720p", "1080p", "2k", "4k", "8k"],
+  style: ["в стиле 1999", "в стиле 2004", "в стиле 2010", "ретро", "неон", "винтаж"],
+};
+function detect(text) {
+  const hits = [];
+  const push = (m, type, extra) => hits.push(Object.assign(
+    { s: m.index, e: m.index + m[0].length, type }, extra));
+  let m, re;
+  re = /(\d+)\s*%/g;
+  while ((m = re.exec(text))) push(m, "percent", { val: +m[1] });
+  re = /(\d+)\s*(?:°|градус(?:ов|а)?)/gi;
+  while ((m = re.exec(text))) push(m, "angle", { val: +m[1] });
+  re = /\b(720p|1080p|2k|4k|8k|hd|full\s?hd)\b/gi;
+  while ((m = re.exec(text))) push(m, "preset", { kind: "res" });
+  // «в стиле» is mandatory: a bare year turns «нарисуй 2000 звёзд» into a style
+  // chip that cycles «2000» -> «в стиле 1999» on a click.
+  re = /в\s+стиле\s+((?:19|20)\d{2})/gi;
+  while ((m = re.exec(text))) push(m, "preset", { kind: "style" });
+  re = /[а-яё]+(?:-[а-яё]+)*/gi;                   // whole words, then colour-test
+  while ((m = re.exec(text))) {
+    const p = colorParts(m[0]);
+    if (p) push(m, "color", p);
+  }
+  // JS \b is ASCII-only, so `\bтри` never matched — word-numbers were dead. Use an
+  // explicit Cyrillic/Latin/digit lookbehind instead.
+  const numAlt = "\\d{1,3}|" + Object.keys(WORD2NUM).join("|");
+  re = new RegExp("(?<![а-яёa-z0-9])(" + numAlt + ")(?=\\s+[а-яё]{2,})", "gi");
+  while ((m = re.exec(text))) push(m, "count", { word: m[0] });
+  hits.sort((a, b) => a.s - b.s || (b.e - b.s) - (a.e - a.s));
+  const out = []; let last = -1;
+  for (const h of hits) if (h.s >= last) { out.push(h); last = h.e; }
+  return out;
+}
+
+// ---------- plain-text (de)serialization; aux (ghost/phrase) excluded -------
+function isAux(node) {
+  return node.classList && (node.classList.contains("ghost") || node.classList.contains("phrase"));
+}
+const BLOCK = new Set(["DIV", "P", "LI"]);
+function textLen(node) {
+  if (node.nodeType === 3) return node.data.length;
+  if (isAux(node)) return 0;
+  if (node.classList && node.classList.contains("chip")) return node.dataset.text.length;
+  if (node.tagName === "BR") return 1;    // serialize() emits "\n" here — must agree,
+  let n = 0;                              // or every newline shifts the caret by one
+  for (const c of node.childNodes) n += textLen(c);
+  return n;
+}
+function serialize(root) {
+  let out = "";
+  for (const c of root.childNodes) {
+    if (c.nodeType === 3) out += c.data;
+    else if (isAux(c)) continue;
+    else if (c.classList && c.classList.contains("chip")) out += c.dataset.text;
+    else if (c.tagName === "BR") out += "\n";
+    else {
+      if (BLOCK.has(c.tagName) && out && !out.endsWith("\n")) out += "\n";
+      out += serialize(c);
+    }
+  }
+  return out;
+}
+function getCaret(root) {
+  const sel = getSelection();
+  if (!sel.rangeCount) return null;
+  const r = sel.getRangeAt(0);
+  if (!root.contains(r.endContainer)) return null;
+  const pre = r.cloneRange();
+  pre.selectNodeContents(root);
+  pre.setEnd(r.endContainer, r.endOffset);
+  const frag = pre.cloneContents();
+  let n = 0; for (const c of frag.childNodes) n += textLen(c);
+  return n;
+}
+function setCaret(root, off) {
+  if (off == null) return;
+  let remaining = off;
+  const walk = (node) => {
+    for (const c of node.childNodes) {
+      if (isAux(c)) continue;
+      if (c.nodeType === 3) {
+        if (remaining <= c.data.length) {
+          const r = document.createRange(); r.setStart(c, remaining); r.collapse(true);
+          const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); return true;
+        }
+        remaining -= c.data.length;
+      } else if (c.classList && c.classList.contains("chip")) {
+        const len = c.dataset.text.length;
+        if (remaining <= len) {
+          const r = document.createRange();
+          // offset 0 means *before* the chip — placing the caret after it would
+          // teleport the caret across a leading chip («4 девушки…») on every rebuild
+          if (remaining === 0) r.setStartBefore(c); else r.setStartAfter(c);
+          r.collapse(true);
+          const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); return true;
+        }
+        remaining -= len;
+      } else if (c.tagName === "BR") {
+        if (remaining <= 1) { const r = document.createRange(); r.setStartAfter(c); r.collapse(true);
+          const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); return true; }
+        remaining -= 1;
+      } else if (walk(c)) return true;
+    }
+    return false;
+  };
+  if (!walk(root)) {
+    const r = document.createRange(); r.selectNodeContents(root); r.collapse(false);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }
+}
+function chipEl(cls, dataText) {
+  const c = document.createElement("span");
+  c.className = "chip " + cls; c.contentEditable = "false"; c.dataset.text = dataText;
+  return c;
+}
+function mkStep(sym, fn) {
+  const s = document.createElement("span"); s.className = "step"; s.textContent = sym;
+  s.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); fn(); });
+  return s;
+}
+function makeCount(h) {
+  const isWord = isNaN(+h.word);
+  const fem = isWord && NUM_F.includes(h.word.toLowerCase());
+  let val = isWord ? WORD2NUM[h.word.toLowerCase()] : +h.word;
+  const c = chipEl("count", h.word);
+  const render = () => {
+    const disp = isWord ? (fem ? NUM_F : NUM_M)[Math.min(val, 10)] : String(val);
+    c.dataset.text = disp; c.innerHTML = "";
+    const minus = mkStep("−", () => { val = Math.max(0, val - 1); render(); reflow(); });
+    const b = document.createElement("b"); b.textContent = disp;
+    const plus = mkStep("+", () => { val = Math.min(isWord ? 10 : 999, val + 1); render(); reflow(); });
+    c.append(minus, b, plus);
+  };
+  render(); return c;
+}
+function makePercent(h) {
+  let val = h.val;
+  const c = chipEl("percent", val + "%");
+  const b = document.createElement("b");
+  const pop = document.createElement("span"); pop.className = "pop";
+  const range = document.createElement("input");
+  range.type = "range"; range.min = 0; range.max = 100; range.value = val;
+  const lbl = document.createElement("span");
+  const paint = () => { b.textContent = val + "%"; lbl.textContent = val + "%"; c.dataset.text = val + "%"; };
+  range.addEventListener("input", (e) => { e.stopPropagation(); val = +range.value; paint(); reflow(); });
+  pop.append(range, lbl); c.append(b, pop); paint();
+  c.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation();
+    document.querySelectorAll(".pop.open").forEach((p) => p !== pop && p.classList.remove("open"));
+    pop.classList.toggle("open"); });
+  pop.addEventListener("mousedown", (e) => e.stopPropagation());
+  return c;
+}
+function makeAngle(h) {
+  let val = h.val % 360;
+  const c = chipEl("angle", val + "°");
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 20 20"); svg.setAttribute("class", "dial");
+  const circ = document.createElementNS(svg.namespaceURI, "circle");
+  circ.setAttribute("cx", 10); circ.setAttribute("cy", 10); circ.setAttribute("r", 8);
+  const line = document.createElementNS(svg.namespaceURI, "line");
+  line.setAttribute("x1", 10); line.setAttribute("y1", 10);
+  svg.append(circ, line);
+  const b = document.createElement("b");
+  const paint = () => {
+    const a = (val - 90) * Math.PI / 180;
+    line.setAttribute("x2", 10 + 7 * Math.cos(a));
+    line.setAttribute("y2", 10 + 7 * Math.sin(a));
+    b.textContent = val + "°"; c.dataset.text = val + "°";
+  };
+  const drag = (e) => {
+    const rect = svg.getBoundingClientRect();
+    const dx = e.clientX - (rect.left + rect.width / 2);
+    const dy = e.clientY - (rect.top + rect.height / 2);
+    val = Math.round((Math.atan2(dy, dx) * 180 / Math.PI + 90 + 360) % 360);
+    paint(); reflow();
+  };
+  svg.addEventListener("mousedown", (e) => {
+    e.preventDefault(); e.stopPropagation(); drag(e);
+    const move = (ev) => drag(ev);
+    const up = () => { document.removeEventListener("mousemove", move);
+                       document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+  });
+  c.append(svg, b); paint(); return c;
+}
+function makeColor(h, word) {
+  let cur = word;                       // the word as it stands in the prompt text
+  const c = chipEl("color", cur);
+  const sw = document.createElement("span"); sw.className = "swatch";
+  const txt = document.createElement("span");
+  const inp = document.createElement("input"); inp.type = "color";
+  inp.style.cssText = "width:0;height:0;opacity:0;position:absolute;";
+  c.title = "Выбрать цвет — слово в промпте изменится";
+  const paint = () => {
+    sw.style.background = colorHex(cur);
+    inp.value = colorHex(cur);
+    txt.textContent = cur;
+    c.dataset.text = cur;
+  };
+  // A swatch that recolours but leaves the word alone is a lie: the prompt still
+  // says «синий». Snap the picked colour to the nearest nameable one and rewrite
+  // the word in the SAME grammatical form (морфокод из модели).
+  inp.addEventListener("input", (e) => {
+    e.stopPropagation();
+    const form = recolor(cur, inp.value);
+    if (form) { cur = form; paint(); reflow(); }
+    else sw.style.background = inp.value;      // no such form in the vocab: swatch only
+  });
+  c.append(sw, txt, inp); paint();
+  c.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); inp.click(); });
+  return c;
+}
+function makePreset(h, word) {
+  const list = (PRESETS[h.kind] || []).slice();   // copy: unshift below must not
+  let i = list.findIndex((v) => v.toLowerCase() === word.toLowerCase());
+  if (i < 0) { list.unshift(word); i = 0; }       // grow the shared PRESETS array
+  const c = chipEl("preset", word);
+  const b = document.createElement("b"); const caret = document.createElement("span");
+  caret.textContent = "▸"; caret.style.opacity = ".55";
+  const paint = () => { b.textContent = list[i]; c.dataset.text = list[i]; };
+  c.append(b, caret); paint();
+  c.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation();
+    i = (i + 1) % list.length; paint(); reflow(); });
+  return c;
+}
+function buildChip(h, text) {
+  const raw = text.slice(h.s, h.e);
+  switch (h.type) {
+    case "count":   return makeCount(h);
+    case "percent": return makePercent(h);
+    case "angle":   return makeAngle(h);
+    case "color":   return makeColor(h, raw);
+    case "preset":  return makePreset(h, raw);
+  }
+}
+
+// ============================================================================
+// PART 3 — LLM phrase layer (mirrors ghost.html) =============================
+// ============================================================================
+const DEBOUNCE_MS = 400;
+const phraseCache = new Map();
+let llmEnabled = true;
+let debPhrase = null, inflight = null, phrase = "";
+function shouldSuggest(text) {
+  if (TAIL.test(text)) return false;
+  return (text.match(WORD) || []).length >= 2;
+}
+function requestPhrase(text) {
+  if (phraseCache.has(text)) { setPhrase(phraseCache.get(text), text); return; }
+  const ctrl = new AbortController(); inflight = ctrl; spin.textContent = "…";
+  fetch("/next", { method: "POST", signal: ctrl.signal,
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) })
+    .then((r) => r.json()).then((res) => {
+      spin.textContent = "";
+      if (text !== serialize(el)) return;
+      if (res.reason === "no_key") {     // tell the user, don't just go quiet
+        llmEnabled = false;
+        hint.innerHTML = "<kbd>Tab</kbd> — принять окончание · подсказка следующего "
+                       + "слова выключена: не задан OPENROUTER_API_KEY";
+        return;
+      }
+      const s = res.ok ? res.suggestion : "";
+      phraseCache.set(text, s); setPhrase(s, text, res.ttft_ms);
+    }).catch(() => { spin.textContent = ""; });
+}
+function setPhrase(s, forText, ttft) {
+  if (forText !== serialize(el)) return;
+  phrase = s || "";
+  if (phrase) { appendAux("phrase", phrase); if (ttft) status.textContent = `LLM ${ttft} мс`; }
+}
+function clearPhrase() {
+  phrase = "";
+  el.querySelectorAll(".phrase").forEach((n) => n.remove());
+  if (inflight) { inflight.abort(); inflight = null; }
+  if (debPhrase) { clearTimeout(debPhrase); debPhrase = null; }
+  spin.textContent = "";
+}
+
+// ============================================================================
+// PART 4 — unified wiring ====================================================
+// ============================================================================
+const el = document.getElementById("prompt");
+const status = document.getElementById("status");
+const spin = document.getElementById("spin");
+const hint = document.getElementById("hint");
+let ghost = "", composing = false, deb = null;
+
+function reflow() { status.textContent = ""; }
+function stripAux() { el.querySelectorAll(".ghost,.phrase").forEach((n) => n.remove()); }
+function appendAux(cls, text) {
+  const s = document.createElement("span");
+  s.className = cls; s.contentEditable = "false"; s.textContent = text;
+  el.append(s);
+}
+
+// instant offline ghost + schedule the (network) phrase — never rebuilds chips
+function paintGhost() {
+  clearPhrase();
+  stripAux();
+  ghost = "";
+  const T = serialize(el);
+  const caret = getCaret(el);
+  const t0 = performance.now();
+  if (caret != null && caret === T.length) {
+    const g = ghostFor(T);
+    if (g) { ghost = g; appendAux("ghost", g); }
+  }
+  status.textContent = ghost ? `${(performance.now() - t0).toFixed(1)} мс` : "";
+  if (llmEnabled && caret === T.length && !ghost && shouldSuggest(T)) {
+    debPhrase = setTimeout(() => requestPhrase(T), DEBOUNCE_MS);
+  }
+}
+
+// newlines live in the plain text as "\n" and in the DOM as <br> (see serialize)
+function appendText(frag, s) {
+  s.split("\n").forEach((part, i) => {
+    if (i) frag.append(document.createElement("br"));
+    if (part) frag.append(document.createTextNode(part));
+  });
+}
+
+// debounced chip re-render, caret preserved; skips the token under the caret
+function chipify(force) {
+  if (composing) return;
+  stripAux();
+  const text = serialize(el);
+  const caret = getCaret(el);
+  const hits = detect(text).filter((h) => force || caret == null || caret < h.s || caret > h.e);
+  const sig = hits.map((h) => h.type + h.s + h.e).join(",");
+  if (!force && sig === el._sig) return;               // nothing structural changed
+  el._sig = sig;
+  const frag = document.createDocumentFragment();
+  let i = 0;
+  for (const h of hits) {
+    if (h.s > i) appendText(frag, text.slice(i, h.s));
+    frag.append(buildChip(h, text));
+    i = h.e;
+  }
+  if (i < text.length) appendText(frag, text.slice(i));
+  el.innerHTML = ""; el.append(frag);
+  setCaret(el, caret);
+}
+
+function refresh(force) { chipify(force); paintGhost(); }
+
+el.addEventListener("input", () => {
+  paintGhost();                                        // instant ending-ghost
+  clearTimeout(deb); deb = setTimeout(() => refresh(false), 140);  // settle chips
+});
+el.addEventListener("keydown", (e) => {
+  if (e.key === "Tab" && (ghost || phrase)) {
+    e.preventDefault();
+    // a safe-partial ghost lands mid-word («детализирован» + «н») — a space there
+    // would break the word in half
+    const add = ghost ? ghost + (ghostPartial ? "" : " ") : phrase + " ";
+    clearPhrase(); stripAux(); ghost = "";
+    const last = el.lastChild;
+    if (last && last.nodeType === 3) last.data += add;
+    else el.append(document.createTextNode(add));
+    const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    refresh(false);
+    return;
+  }
+  // browsers answer Enter with a <div> block, which serialize() flattens away —
+  // the line break silently vanished 140 ms later. Insert a <br> ourselves.
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    stripAux(); clearPhrase(); ghost = "";
+    document.execCommand("insertLineBreak");
+    setTimeout(() => refresh(false), 0);
+    return;
+  }
+  if (e.key === " " || e.key === ",") setTimeout(() => refresh(false), 0);
+});
+// paste dropped raw HTML (fonts, colours, even <img>) straight into the field
+el.addEventListener("paste", (e) => {
+  e.preventDefault();
+  const t = (e.clipboardData || window.clipboardData).getData("text/plain");
+  document.execCommand("insertText", false, t.replace(/\r\n?/g, "\n"));
+});
+el.addEventListener("compositionstart", () => { composing = true; });
+el.addEventListener("compositionend", () => { composing = false; refresh(false); });
+document.addEventListener("mousedown", (e) => {
+  if (!e.target.closest(".chip")) document.querySelectorAll(".pop.open").forEach((p) => p.classList.remove("open"));
+});
+
+window.addEventListener("load", () => {
+  el.textContent = "нарисуй 4 девушки, синий фон, резкость 80%, в тёмном лес";
+  el.focus(); refresh(true);
+});
+</script>
+</body>
+</html>

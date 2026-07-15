@@ -1,0 +1,3 @@
+# Runtime: the completer core needs ONLY the Python standard library.
+# streamlit is required just for the demo UI (app.py).
+streamlit>=1.30

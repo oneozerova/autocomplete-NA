@@ -1,0 +1,28 @@
+# Everything here would otherwise be shipped into the build context and bloat the
+# image. The raw corpora alone are ~60 MB and are build-time inputs, never runtime.
+data/
+experiments/
+tests/
+examples/
+scripts/bench_llm.py
+scripts/domain_probe.py
+
+.git/
+.gitignore
+.history/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# The Streamlit demo is a local dev tool; the container serves scripts/serve.py.
+app.py
+requirements.txt
+requirements-dev.txt
+README.md
+
+# Secrets never enter an image — OPENROUTER_API_KEY is injected as an env var at
+# runtime by Dokploy. A key baked into a layer is a key you cannot rotate.
+.env
+.env.*
