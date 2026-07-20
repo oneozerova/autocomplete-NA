@@ -9,3 +9,9 @@ data/ru_full.txt
 data/rus_sentences.tsv.bz2
 data/leipzig.tar.gz
 data/prompt_corpus.txt
+
+.history/
+.pytest_cache/
+.env
+.env.*
+__pycache__/

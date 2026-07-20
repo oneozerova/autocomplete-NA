@@ -13,15 +13,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Copied in one layer: these artifacts change together and there are no deps to
-# cache separately (the usual "requirements.txt first" trick buys nothing here).
-#   models/  — web_model.json (12 MB) is baked into the served page; the rest
-#              (ngram/context/vocab) is only needed by the Python Completer. Drop
-#              them from this COPY if you never add a server-side /complete route.
-COPY src/      ./src/
-COPY scripts/  ./scripts/
-COPY frontend/ ./frontend/
-COPY models/   ./models/
+# The service runs the LLM next-tag layer (src/llm_next.py → OpenRouter), which
+# is pure stdlib and needs NO model files. The only artifact copied is
+# web_model.json (12 MB), used by the optional self-contained demo page at `/`.
+# The 40 MB of Completer models (ngram/context/vocab/morph) are deliberately
+# left out: word-endings run client-side for zero latency, so the server never
+# loads them. Add them back only if you introduce a server-side /complete route.
+COPY src/                   ./src/
+COPY scripts/               ./scripts/
+COPY frontend/              ./frontend/
+COPY models/web_model.json  ./models/web_model.json
 
 # Run unprivileged: the process only ever reads its own artifacts and makes an
 # outbound HTTPS call, so it has no reason to be root inside the container.
