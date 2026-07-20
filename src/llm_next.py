@@ -41,7 +41,15 @@ _ANY_WORD = re.compile(r"[а-яёА-ЯЁ]+")
 
 # A small, fast model is the right tool for inline suggestion; a chat-grade model
 # is too slow. Override with OPENROUTER_MODEL. (Any OpenRouter model id works.)
-DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+#
+# Default chosen by scripts/bench_latency.py: on Groq's LPU, llama-3.3-70b returns
+# TTFT p50 ~357 ms vs ~739 ms for gpt-4o-mini (2x) with better Russian output.
+# Provider is the dominant latency lever — client-side tricks (connection reuse,
+# shorter prompt) were lost in the provider's server-side TTFT variance.
+DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
+# Pin the fast backend. allow_fallbacks keeps us resilient if Groq is down (a
+# slower answer beats none; the debouncer + cache absorb the occasional tail).
+DEFAULT_PROVIDER = {"order": ["Groq"], "allow_fallbacks": True}
 
 # The task, pinned so the model returns a bare continuation, not a chat reply.
 SYSTEM_PROMPT = (
@@ -67,36 +75,48 @@ class NextResult:
 class LLMNext:
     def __init__(self, api_key: str | None, model: str = DEFAULT_MODEL,
                  timeout: float = 2.5, max_tokens: int = 12,
-                 temperature: float = 0.2):
+                 temperature: float = 0.2, provider: dict | None = None):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.provider = DEFAULT_PROVIDER if provider is None else provider
 
     @classmethod
     def from_env(cls, **kw) -> "LLMNext":
         return cls(api_key=os.environ.get("OPENROUTER_API_KEY"), **kw)
 
     # ---- main API -------------------------------------------------------
-    def predict(self, text: str, stop: threading.Event | None = None) -> NextResult:
+    def predict(self, text: str, stop: threading.Event | None = None,
+                provider: dict | None = None,
+                system_prompt: str | None = None) -> NextResult:
         """Predict the next word/phrase for `text`. Streams so we can measure TTFT
-        and abort early via `stop`. Never raises — failures come back as ok=False."""
+        and abort early via `stop`. Never raises — failures come back as ok=False.
+
+        `provider` is passed through as OpenRouter's provider-routing object
+        (e.g. {"sort": "latency"} or {"order": ["Groq"]}) — the biggest latency
+        lever. `system_prompt` overrides the default (to test prefill length).
+        Both exist for scripts/bench_latency.py; production callers ignore them."""
         if not self.api_key:
             return NextResult(ok=False, reason="no_key", model=self.model)
         if not text.strip():
             return NextResult(ok=False, reason="empty_input", model=self.model)
 
-        body = json.dumps({
+        payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
                 {"role": "user", "content": text},
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "stream": True,
-        }).encode("utf-8")
+        }
+        prov = provider if provider is not None else self.provider
+        if prov:
+            payload["provider"] = prov
+        body = json.dumps(payload).encode("utf-8")
 
         req = urllib.request.Request(
             OPENROUTER_URL, data=body, method="POST",
